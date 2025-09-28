@@ -1,0 +1,392 @@
+﻿using System.Collections.Generic;
+using System;
+using Autodesk.Revit.ApplicationServices;
+using Autodesk.Revit.DB.Events;
+using Autodesk.Revit.UI;
+using Autodesk.Revit.UI.Events;
+using Autodesk.Revit.DB;
+using Autodesk.Revit.Attributes;
+using Revit2Gltf.glTF;
+using Revit2Gltf.socket;
+using Revit2Gltf.utils;
+using System.Diagnostics;
+using Newtonsoft.Json;
+using Revit2Gltf.http;
+using System.IO;
+
+namespace Revit2Gltf
+{
+    [Transaction(TransactionMode.Manual)]
+    [Regeneration(RegenerationOption.Manual)]
+
+    /// <summary>
+    /// 插件入口类，需实现IExternalApplication两个抽象函数：OnStartup和OnShutdown
+    /// </summary>
+    class App : IExternalApplication
+    {
+        private UIApplication uiApp = null;
+        private Socket socket = null;
+        private KeyValuePair<int, SocketRequestParam> currentWsMessage;
+        // 队列信息读取处理的锁
+        private bool readMsgLock = false;
+        // 等待视图切换
+        private bool waitChangeVeiw = false;
+        // 空闲事件参数
+        private IdlingEventArgs _IdlingEventArgs = null;
+
+        /// <summary>
+        /// Revit启动时执行,挂载事件
+        /// </summary>
+        /// <param name="application">此参数类不提供访问Revit的功能</param>
+        /// <returns></returns>
+        public Result OnStartup(UIControlledApplication application)
+        {
+            #region Socket监听并执行命令
+            //允许跨线程访问，忽略错误
+            // System.Windows.Forms.Control.CheckForIllegalCrossThreadCalls = false;
+
+            // 创建并启动Socket监听
+            //socket = new Socket("192.168.5.82", 8081);
+            socket = new Socket("192.168.5.73", 8081,this);
+            socket.StartListening();
+
+            application.ControlledApplication.ApplicationInitialized += OnApplicationInitialized;
+            #endregion
+
+            // 文件打开后的处理事件（此事件在Revit完成打开文档后立即引发。即使文档打开失败或被取消(在DocumentOpening事件期间)，也会引发该事件）
+            application.ControlledApplication.DocumentOpened += DocumentOpened;
+            // 文件关闭后的处理事件
+            application.ControlledApplication.DocumentClosed += DocumentClosed;
+            // 文件保存完的事件
+            application.ControlledApplication.DocumentSaved += DocumentSaved;
+
+            // 注册弹窗显示事件
+            application.DialogBoxShowing += new EventHandler<DialogBoxShowingEventArgs>(AppDialogShowing);
+
+            return Result.Succeeded; 
+        }
+
+        public Result OnShutdown(UIControlledApplication application)
+        {
+            application.ControlledApplication.ApplicationInitialized -= OnApplicationInitialized;
+            application.ControlledApplication.DocumentOpened -= DocumentOpened;
+            application.ControlledApplication.DocumentClosed -= DocumentClosed;
+            application.ControlledApplication.DocumentSaved -= DocumentSaved;
+            application.DialogBoxShowing -= new EventHandler<Autodesk.Revit.UI.Events.DialogBoxShowingEventArgs>(AppDialogShowing);
+            
+            return Result.Succeeded;
+        }
+
+        private void OnApplicationInitialized(object sender, ApplicationInitializedEventArgs e)
+        {
+            //获取UIApplication对象
+            Application app = sender as Application;
+            uiApp = new UIApplication(app);
+
+            #region 空闲事件
+            uiApp.Idling += HandleMessage;
+            #endregion
+            #region 视图激活事件
+            uiApp.ViewActivated += HandleViewActivated;
+            #endregion
+        }
+
+        //循环处理消息
+        private void HandleMessage(object sender, IdlingEventArgs e)
+        {
+            if (!MessageStation.Messages.HasMessage)
+            {
+                uiApp.Idling -= HandleMessage;
+
+                _IdlingEventArgs = null;
+                return;
+            }
+
+            _IdlingEventArgs = e;
+
+            if (MessageStation.Messages.HasMessage && !readMsgLock && !waitChangeVeiw)
+            {
+                KeyValuePair<int, SocketRequestParam> message = MessageStation.Messages.GetMessage();
+                if (message.Key == -1 || message.Value.filePath == "") { return; }
+
+                try
+                {
+                    // 处理逻辑：打开rvt文件，查找命令开始执行转换
+                    #region 在后台打开文件，UI上不会显示
+                    //Document document = uiApp.Application.OpenDocumentFile(message.Value);
+                    #endregion
+
+                    #region 先关闭文件，再打开文件，在UI上显示
+                    // 关闭已打开的
+                    uiApp.PostCommand(RevitCommandId.LookupPostableCommandId(PostableCommand.Close));
+
+                    readMsgLock = true;
+                    // 文件路径里的 \\ 转换为 \
+                    message.Value.filePath = message.Value.filePath.Replace("\\\\", "\\");
+                    currentWsMessage = message;
+
+                    uiApp.OpenAndActivateDocument(currentWsMessage.Value.filePath);
+                    currentWsMessage.Value.socket.Send("Event:准备打开文件.");
+                    #endregion
+                }
+                catch (Exception)
+                {
+                }
+            }
+
+            // 触发下一次Idling事件，解决Revit窗口不处于活动状态时，Idling事件不会触发的问题。
+            //System.Threading.Thread.Sleep(2000);
+            //e.SetRaiseWithoutDelay();
+        }
+
+        // 立马触发下一次Idling事件
+        public void SetRaiseWithoutDelay()
+        {
+            if(_IdlingEventArgs == null)
+            {
+                uiApp.Idling += HandleMessage;
+            }
+        }
+
+        // 文件打开后的处理
+        private void DocumentOpened(object sender,DocumentOpenedEventArgs e)
+        {
+            // 消息读取锁住的时候才是websocket打开的文件
+            if (readMsgLock && e.Status == RevitAPIEventStatus.Succeeded)
+            {
+                // 执行转GLTF导出前的准备工作
+                setoutExportGltf();
+            }
+        }
+
+        // 文件关闭后的处理
+        private void DocumentClosed(object sender, DocumentClosedEventArgs e)
+        {
+            readMsgLock = false;
+            waitChangeVeiw = false;
+            currentWsMessage = new KeyValuePair<int, SocketRequestParam>(-1, new SocketRequestParam());
+        }
+
+        // 文件保存完的事件
+        private void DocumentSaved(object sender, DocumentSavedEventArgs e)
+        {
+            if (currentWsMessage.Value.filePath != "")
+            {
+                // 删除保存时的备份文件
+                Common.DeleteBackupFile(currentWsMessage.Value.filePath);
+            }
+        }
+
+        // 视图激活事件
+        private void HandleViewActivated(object sender, ViewActivatedEventArgs e)
+        {
+            currentWsMessage.Value.socket.Send("Event:激活视图");
+            setoutExportGltf();
+        }
+
+        // 消息处理完成
+        private void HandleMessageCompleted()
+        {
+            readMsgLock = false;
+            waitChangeVeiw = false;
+            currentWsMessage = new KeyValuePair<int, SocketRequestParam>(-1, new SocketRequestParam());
+            // 关闭已打开的
+            uiApp.PostCommand(RevitCommandId.LookupPostableCommandId(PostableCommand.Close));
+
+            // 触发下一次Idling事件，解决Revit窗口不处于活动状态时，Idling事件不会触发的问题。
+            SetRaiseWithoutDelay();
+        }
+
+        private void setoutExportGltf()
+        {
+            // 判断文件是否已加载显示到UI界面上
+            RevitCommandId revitCmdId = RevitCommandId.LookupPostableCommandId(PostableCommand.Default3DView);
+            if (!uiApp.CanPostCommand(revitCmdId)){
+                System.Threading.Thread.Sleep(1000);
+                
+                setoutExportGltf();
+                return;
+            }
+
+            try
+            {
+                UIDocument uidoc = uiApp.ActiveUIDocument;
+                if (uidoc == null)
+                {
+                    throw new Exception("文档是损坏的！");
+                }
+                Document doc = uidoc.Document;
+
+                // 保存文件（文件有可能经过升级流程，防止二次打开再升级）
+                doc.Save();
+
+                // 如果打开的不是3D视图
+                if (!doc.ActiveView.GetType().Equals(typeof(View3D)))
+                {
+                    try
+                    {
+                        // 在 Idling 事件中无法执行成功
+                        //Common.OpenDefault3DView(doc, uiApp);
+                        //打开 Default3DView
+                        RevitCommandId cmdid = RevitCommandId.LookupPostableCommandId(PostableCommand.Default3DView);
+                    }
+                    catch (Exception ex)
+                    {
+                        View3D view = Common.Get3dView(doc);
+                        if (view == null)
+                        {
+                            throw new Exception($"1.{ex.Message}  \r\n  2.文档缺少3D视图！");
+                        }
+
+                        // 异步切换为3D视图
+                        waitChangeVeiw = true;
+                        uidoc.RequestViewChange(view);
+                        return;
+                    }
+                }
+                else
+                {
+                    exportGltf();
+                }
+            }
+            catch (Exception e)
+            {
+                Common.SendSocketFailMsg(currentWsMessage, 0.0, e.Message);
+
+                HandleMessageCompleted();
+            }
+        }
+
+        private void exportGltf()
+        {
+            bool isSuccess = false;
+            Stopwatch stopWatch = new Stopwatch();
+            //测量运行时间
+            stopWatch.Start();
+
+            try
+            {
+                UIDocument uidoc = uiApp.ActiveUIDocument;
+                Document doc = uidoc.Document;
+
+                SocketTransformSetting options = currentWsMessage.Value.options;
+
+                // 必须启动事务以设置视图上的参数:
+                using (Transaction t = new Transaction(doc,"设置视图参数"))
+                {
+                    t.Start("Change to 3D view");
+                    //视图的详细程度
+                    uidoc.ActiveView.get_Parameter(BuiltInParameter.VIEW_DETAIL_LEVEL).Set((int)ViewDetailLevel.Fine);
+                    // 视觉样式
+                    if(options.RenderMode == "colour")
+                    {
+                        uidoc.ActiveView.get_Parameter(BuiltInParameter.MODEL_GRAPHICS_STYLE).Set((int)DisplayStyle.ShadingWithEdges);
+                    }
+                    else
+                    {
+                        uidoc.ActiveView.get_Parameter(BuiltInParameter.MODEL_GRAPHICS_STYLE).Set((int)DisplayStyle.Realistic);
+                    }
+                   
+                    t.Commit();
+                }
+
+                //在项目中截取错误/警告弹窗
+                using (Transaction transaction = new Transaction(doc, "忽略错误"))
+                {
+                    try
+                    {
+                        /** 事务开始，对错误进行处理 **/
+                        FailureHandlingOptions failTs = transaction.GetFailureHandlingOptions();
+                        failTs.SetFailuresPreprocessor(new FailurePreprocessor());
+                        transaction.SetFailureHandlingOptions(failTs);
+                        transaction.Start();
+
+                        #region 导出主体代码
+
+                        #region 获取当前项目所有的构件并设置选中 debug:使用CustomExporter.Export(doc.ActiveView)不需要选中
+                        //FilteredElementCollector collectorAll = new FilteredElementCollector(doc);
+                        //collectorAll.WherePasses(new LogicalOrFilter(new ElementIsElementTypeFilter(false), new ElementIsElementTypeFilter(true)));
+                        //ICollection<ElementId> elemIds = collectorAll.ToElementIds();
+                        // 设置元素选中
+                        //uidoc.Selection.SetElementIds(elemIds);
+                        #endregion
+
+                        string gltfPath = $"{Common.GetUtcNowTimeStamp()}.glb";
+                        string fileName = $"{Path.GetDirectoryName(currentWsMessage.Value.filePath)}/{gltfPath}";
+
+                        //glTFExportContext context = new glTFExportContext(doc, setting);
+                        // glTFStructureExportContext 包含bom树结构整理和导出
+                        glTFStructureExportContext context = new glTFStructureExportContext(doc, fileName, currentWsMessage.Value);
+                        CustomExporter exporter3d = new CustomExporter(doc, context);
+                        exporter3d.IncludeGeometricObjects = false;
+                        exporter3d.ShouldStopOnError = true;
+                        //exporter.Export(new List<ElementId>() { doc.ActiveView.Id });
+                        exporter3d.Export(doc.ActiveView);
+
+                        // 停止计时
+                        stopWatch.Stop();
+
+                        // 上传至oss
+                        var sign = Api.UploadOss(fileName, "upload/drawingModel/rvt2glb", gltfPath);
+                        // 上传成功后删除本地文件
+                        File.Delete(fileName);
+
+                        //currentWsMessage.Value.socket.Send($"oss 签名：{sign}");
+
+                        // socket 回复
+                        var sr = new SocketResponse();
+                        sr.fileId = currentWsMessage.Value.fileId;
+                        sr.sessionId = currentWsMessage.Value.sessionId;
+                        sr.type = "completed";
+                        sr.runSeconds = stopWatch.Elapsed.TotalSeconds;
+                        sr.gltfPath = sign.url;
+                        sr.filePath = currentWsMessage.Value.filePath;
+                        sr.errMsg = "";
+                        string jsonData = JsonConvert.SerializeObject(sr);
+                        currentWsMessage.Value.socket.Send(jsonData);
+                        #endregion
+
+                        isSuccess = true;
+                        transaction.Commit();
+                    }
+                    catch (Exception e)
+                    {
+                        if (transaction.GetStatus() == TransactionStatus.Started) {
+                            // 回滚事务，丢弃更改
+                            transaction.RollBack();
+                        }
+                            
+                        throw new Exception($"转换失败:{e.Message}" /* \r\n 详细：{ e.ToString() }" */);
+                    }
+                    finally
+                    {
+                        transaction.Dispose();
+                    }
+                }
+            }
+            catch (Exception e)
+            {
+                if(isSuccess)
+                {
+                    // websocket 已回复成功时禁止错误回复
+                    return;
+                }
+                stopWatch.Stop();
+
+                Common.SendSocketFailMsg(currentWsMessage, stopWatch.Elapsed.TotalSeconds, $"{e.Message}" /* \r\n 详细：{ e.ToString() }" */);
+            }
+            finally 
+            {
+                stopWatch.Stop();
+
+                HandleMessageCompleted();
+            }
+        }
+
+        // 弹窗显示事件,在对话显示之前做一些工作
+        private void AppDialogShowing(object sender, DialogBoxShowingEventArgs args) {
+            // 非0值会处理掉不会显示 0会显示
+            args.OverrideResult(1);
+        }
+    }
+}
