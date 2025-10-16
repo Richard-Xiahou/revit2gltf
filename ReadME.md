@@ -47,7 +47,7 @@ A tool focused on **converting Autodesk Revit models to GLTF format (and vice ve
 
 * Export Revit models to GLTF format: Fully retain the model's component hierarchy, material properties and geometric shapes.
 
-* Support batch conversion: Process multiple Revit model files at the same time to improve efficiency.
+* Support batch conversion: Process multiple Revit model files in a queue to improve efficiency.
 
 * Conversion parameter configuration: Allow customizing GLTF export precision (e.g., geometric detail level) to balance model quality and size.
 
