@@ -63,7 +63,7 @@ A tool focused on **converting Autodesk Revit models to GLTF format (and vice ve
 
 
 
-* Real-time status feedback: Use Socket communication to send conversion progress (e.g., "30% processing wall components") and success/failure status.
+* Real-time status feedback: Use Socket tell Revit to start the conversion task and communication to send conversion progress and success/failure status.
 
 * Real-time parameter transfer: Support external programs to send configuration parameters (e.g., target export path, compression level) to the conversion module via Socket.
 
@@ -74,5 +74,3 @@ A tool focused on **converting Autodesk Revit models to GLTF format (and vice ve
 * Cross-Revit version compatibility: Adapt to data reading of mainstream Revit versions (e.g., 2020-2024).
 
 * Error log recording: Automatically generate log files (including error reasons and exception locations) when conversion fails, making it easy to troubleshoot problems.
-
-> （注：文档部分内容可能由 AI 生成）
