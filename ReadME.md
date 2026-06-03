@@ -1,6 +1,8 @@
 # revit2gltf
 
 A tool focused on **converting Autodesk Revit models to GLTF format**. It is designed to solve problems like large Revit model size and difficult cross-platform display. It supports lightweight processing of models in fields like architecture and structure, and enables sharing on multiple devices (such as web pages and mobile phones).
+![preview](https://github.com/Richard-Xiahou/revit2gltf/blob/main/images/s1.jpg)
+![preview](https://github.com/Richard-Xiahou/revit2gltf/blob/main/images/s3.jpg)
 
 ## 1. Project Introduction
 
